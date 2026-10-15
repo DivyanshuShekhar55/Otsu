@@ -42,7 +42,7 @@ func (r *record) encode() []byte {
 	valueField := uint32(valueSize) // what we write in the vsz field
 
 	if r.tombstone {
-		valueSize = 0                // no value bytes follow
+		valueSize = 0                 // no value bytes follow
 		valueField = tombstoneMarker // vsz says "I'm a tombstone"
 	}
 
@@ -100,4 +100,18 @@ func decodeRecord(buf []byte) (record, error) {
 		value:     buf[keyEnd:],
 		tombstone: tombstone,
 	}, nil
+}
+
+// sizeFromHeader reads the first headerSize bytes of a record and says how
+// long the WHOLE record is (header + key + value). Recovery uses this to know
+// how many bytes to read next.
+func sizeFromHeader(header []byte) int64 {
+	keySize := int64(binary.BigEndian.Uint32(header[12:16]))
+	valueField := binary.BigEndian.Uint32(header[16:20])
+
+	valueSize := int64(valueField)
+	if valueField == tombstoneMarker {
+		valueSize = 0 // tombstones carry no value bytes
+	}
+	return headerSize + keySize + valueSize
 }
