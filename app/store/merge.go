@@ -14,8 +14,9 @@ import (
 //
 // A hint file sits next to a data file (000007.hint for 000007.data) and
 // lists "where is each key" WITHOUT the values. Reading it on startup is much
-// faster than scanning the whole data file. (Loading hints is a later TODO
-// item; for now merge just writes them.)
+// faster than scanning the whole data file. Merge writes them, and Open reads
+// them back (loadHintFile below), falling back to a full scan if anything is
+// wrong with the hint file.
 //
 //	| crc (4) | ts (8) | key_size (4) | record_size (4) | offset (8) | key |
 //
@@ -39,6 +40,85 @@ func encodeHint(key string, e keydirEntry) []byte {
 	return buf
 }
 
+// hintRecord is one parsed hint line: a key and where it lives.
+type hintRecord struct {
+	key   string
+	entry keydirEntry
+}
+
+// decodeHints parses a whole hint file. If ANY entry is damaged or cut
+// short it returns ErrCorrupt, so the caller never uses half a hint file.
+func decodeHints(data []byte, fileID uint32) ([]hintRecord, error) {
+	var out []hintRecord
+
+	pos := 0
+	for pos < len(data) {
+		// Need a full header first.
+		if len(data)-pos < hintHeaderSize {
+			return nil, ErrCorrupt
+		}
+		h := data[pos : pos+hintHeaderSize]
+
+		// The key must fit inside what is left of the file.
+		keySize := binary.BigEndian.Uint32(h[12:16])
+		if uint64(keySize) > uint64(len(data)-pos-hintHeaderSize) {
+			return nil, ErrCorrupt
+		}
+		end := pos + hintHeaderSize + int(keySize)
+
+		// Checksum covers everything after the crc field.
+		if crc32.ChecksumIEEE(data[pos+4:end]) != binary.BigEndian.Uint32(h[0:4]) {
+			return nil, ErrCorrupt
+		}
+
+		out = append(out, hintRecord{
+			key: string(data[pos+hintHeaderSize : end]),
+			entry: keydirEntry{
+				fileID:    fileID,
+				timestamp: int64(binary.BigEndian.Uint64(h[4:12])),
+				size:      binary.BigEndian.Uint32(h[16:20]),
+				offset:    int64(binary.BigEndian.Uint64(h[20:28])),
+			},
+		})
+		pos = end
+	}
+	return out, nil
+}
+
+// loadHintFile fills the keydir from <id>.hint instead of scanning the data
+// file. It returns true on success. It returns false (and changes NOTHING)
+// if the hint file is missing, damaged, or points outside the data file; the
+// caller then falls back to a full scan.
+//
+// We do not re-check the data records' CRCs here. That is the whole point of
+// the speed-up. Get() still verifies the CRC every time it reads a record.
+func (b *Bitcask) loadHintFile(id uint32, dataSize int64) bool {
+	raw, err := os.ReadFile(hintFileName(b.dir, id))
+	if err != nil {
+		return false // no hint file: the normal case for non-merged files
+	}
+
+	// Parse everything first, so a bad hint file can't leave us with a
+	// half-filled keydir.
+	hints, err := decodeHints(raw, id)
+	if err != nil {
+		return false
+	}
+	for _, h := range hints {
+		if h.entry.offset < 0 || h.entry.offset+int64(h.entry.size) > dataSize {
+			return false
+		}
+	}
+
+	// Same "newest timestamp wins" rule as everywhere else.
+	for _, h := range hints {
+		if !b.isStale(h.key, h.entry.timestamp) {
+			b.keydir[h.key] = h.entry
+		}
+	}
+	return true
+}
+
 // ---------------------------------------------------------------------------
 // Merge
 // ---------------------------------------------------------------------------
@@ -50,8 +130,10 @@ func encodeHint(key string, e keydirEntry) []byte {
 // Simple on purpose: Merge holds the lock the whole time, so reads and writes
 // wait until it finishes. A real Bitcask merges in the background.
 //
-// NOTE: tombstones are copied too (kept forever for now). The "grace period"
-// TODO item will decide when they can be dropped.
+// Tombstones (delete markers) are kept for Options.TombstoneGrace. Dropping
+// one too early is dangerous in a cluster: a replica that missed the delete
+// could later "repair" the old value back into existence. After the grace
+// period we assume every replica has seen the delete and forget it.
 func (b *Bitcask) Merge() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -133,6 +215,7 @@ func (b *Bitcask) writeMergeFiles(dataPath, hintPath string, mergeID uint32) (ma
 
 	newKeydir := make(map[string]keydirEntry, len(b.keydir))
 	var pos int64 // where the next record lands in the merged file
+	now := b.now() // read the clock once so every tombstone is judged the same way
 
 	// The keydir only holds the newest record per key, so everything we
 	// walk here is "live". Old overwritten versions are simply never copied.
@@ -143,8 +226,16 @@ func (b *Bitcask) writeMergeFiles(dataPath, hintPath string, mergeID uint32) (ma
 		}
 
 		// Verify the checksum so we never copy a damaged record forward.
-		if _, err := decodeRecord(buf); err != nil {
+		rec, err := decodeRecord(buf)
+		if err != nil {
 			return nil, fmt.Errorf("merge: key %q: %w", key, err)
+		}
+
+		// A delete marker older than the grace period is forgotten: we
+		// simply don't copy it. Nothing older survives either, because we
+		// only ever copy the newest record per key.
+		if rec.tombstone && now-rec.timestamp > int64(b.tombstoneGrace) {
+			continue
 		}
 
 		// Copy the raw bytes as they are.
