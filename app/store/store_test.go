@@ -1,174 +1,218 @@
 package store
 
 import (
-	"bytes"
-	"errors"
+	"bufio"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
-// ---- helpers ---------------------------------------------------------------
+const crashRecords = 5
 
-// openStore opens a store and closes it automatically when the test ends.
-func openStore(t *testing.T, dir string, opts Options) *Bitcask {
+// referenceLog writes 5 small records into a fresh store and returns the raw
+// bytes of the data file, plus the offset where each record ENDS.
+// The crash tests damage copies of these bytes and check what survives.
+func referenceLog(t *testing.T) (data []byte, ends []int) {
 	t.Helper()
-	b, err := Open(dir, opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { b.Close() })
-	return b
-}
-
-// mustGet fails the test unless key currently holds the value `want`.
-func mustGet(t *testing.T, b *Bitcask, key, want string) {
-	t.Helper()
-	val, _, err := b.Get(key)
-	if err != nil || string(val) != want {
-		t.Fatalf("Get(%q) = %q, %v; want %q", key, val, err, want)
-	}
-}
-
-// mustBeGone fails the test unless key is missing or deleted.
-func mustBeGone(t *testing.T, b *Bitcask, key string) {
-	t.Helper()
-	if _, _, err := b.Get(key); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("Get(%q): want ErrNotFound, got %v", key, err)
-	}
-}
-
-// countFiles counts files in dir that match a pattern like "*.data".
-func countFiles(dir, pattern string) int {
-	m, _ := filepath.Glob(filepath.Join(dir, pattern))
-	return len(m)
-}
-
-// ---- record format ---------------------------------------------------------
-
-// A record that is encoded and decoded should come back identical.
-func TestRecordRoundTrip(t *testing.T) {
-	in := record{timestamp: 42, key: []byte("k"), value: []byte("hello")}
-	out, err := decodeRecord(in.encode())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if out.timestamp != 42 || string(out.key) != "k" || string(out.value) != "hello" || out.tombstone {
-		t.Fatalf("round trip mismatch: %+v", out)
-	}
-}
-
-// Tombstones must survive the round trip and stay distinct from empty values.
-func TestTombstoneRoundTrip(t *testing.T) {
-	del := record{timestamp: 7, key: []byte("k"), tombstone: true}
-	out, err := decodeRecord(del.encode())
-	if err != nil || !out.tombstone {
-		t.Fatalf("want tombstone, got %+v, err=%v", out, err)
-	}
-
-	empty := record{timestamp: 8, key: []byte("k"), value: []byte{}}
-	out, err = decodeRecord(empty.encode())
-	if err != nil || out.tombstone {
-		t.Fatalf("empty value must not be a tombstone: %+v, err=%v", out, err)
-	}
-}
-
-// ---- basic Get / Put / Delete ----------------------------------------------
-
-func TestPutGet(t *testing.T) {
-	b := openStore(t, t.TempDir(), Options{})
-
-	if err := b.Put("a", []byte("1"), 10); err != nil {
-		t.Fatal(err)
-	}
-	val, ts, err := b.Get("a")
-	if err != nil || !bytes.Equal(val, []byte("1")) || ts != 10 {
-		t.Fatalf("got val=%q ts=%d err=%v", val, ts, err)
-	}
-}
-
-// Overwriting a key: Get must return the newest value.
-func TestOverwrite(t *testing.T) {
-	b := openStore(t, t.TempDir(), Options{})
-
-	b.Put("a", []byte("old"), 1)
-	b.Put("a", []byte("new"), 2)
-
-	val, ts, _ := b.Get("a")
-	if string(val) != "new" || ts != 2 {
-		t.Fatalf("got val=%q ts=%d", val, ts)
-	}
-}
-
-// A write with an OLDER timestamp than what we have must be ignored.
-func TestStaleWriteIgnored(t *testing.T) {
-	b := openStore(t, t.TempDir(), Options{})
-
-	b.Put("a", []byte("newer"), 10)
-	b.Put("a", []byte("older"), 5) // arrives late
-
-	mustGet(t, b, "a", "newer")
-
-	// Same for deletes: an old tombstone must not kill a newer value.
-	b.Delete("a", 3)
-	mustGet(t, b, "a", "newer")
-}
-
-func TestMissingKey(t *testing.T) {
-	b := openStore(t, t.TempDir(), Options{})
-	mustBeGone(t, b, "nope")
-}
-
-// After Delete, Get says "not found" but still reports the tombstone's timestamp.
-func TestDelete(t *testing.T) {
-	b := openStore(t, t.TempDir(), Options{})
-
-	b.Put("a", []byte("1"), 1)
-	b.Delete("a", 2)
-
-	_, ts, err := b.Get("a")
-	if !errors.Is(err, ErrNotFound) || ts != 2 {
-		t.Fatalf("want ErrNotFound with ts=2, got ts=%d err=%v", ts, err)
-	}
-}
-
-// Flip one byte on disk: Get must detect it through the CRC.
-func TestCorruptionDetected(t *testing.T) {
 	dir := t.TempDir()
 	b := openStore(t, dir, Options{})
 
-	b.Put("a", []byte("hello world"), 1)
+	pos := 0
+	for i := 0; i < crashRecords; i++ {
+		key, val := fmt.Sprintf("k%d", i), fmt.Sprintf("value-%d", i)
+		b.Put(key, []byte(val), int64(i+1))
+		pos += headerSize + len(key) + len(val)
+		ends = append(ends, pos)
+	}
+	b.Close()
 
-	// Damage the last byte of the file (part of the value).
-	f, err := os.OpenFile(dataFileName(dir, 1), os.O_RDWR, 0)
+	data, err := os.ReadFile(dataFileName(dir, 1))
 	if err != nil {
 		t.Fatal(err)
 	}
-	info, _ := f.Stat()
-	f.WriteAt([]byte{0xFF}, info.Size()-1)
-	f.Close()
+	if len(data) != pos {
+		t.Fatalf("file is %d bytes, expected %d", len(data), pos)
+	}
+	return data, ends
+}
 
-	if _, _, err := b.Get("a"); !errors.Is(err, ErrCorrupt) {
-		t.Fatalf("want ErrCorrupt, got %v", err)
+// checkRecovered opens dir and expects that exactly the first `intact`
+// records survived, and that the store is still usable afterwards.
+func checkRecovered(t *testing.T, dir string, intact int) {
+	t.Helper()
+
+	b, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer b.Close()
+
+	for i := 0; i < crashRecords; i++ {
+		key := fmt.Sprintf("k%d", i)
+		if i < intact {
+			mustGet(t, b, key, fmt.Sprintf("value-%d", i))
+		} else {
+			mustBeGone(t, b, key)
+		}
+	}
+
+	// New writes must work after recovery.
+	if err := b.Put("after", []byte("ok"), 100); err != nil {
+		t.Fatal(err)
+	}
+	mustGet(t, b, "after", "ok")
+}
+
+// Simulates a crash at EVERY possible point of the log: the file is cut
+// after byte 0, 1, 2 ... up to its full length.
+func TestCrashTruncateAtEveryByte(t *testing.T) {
+	data, ends := referenceLog(t)
+	base := t.TempDir()
+
+	for cut := 0; cut <= len(data); cut++ {
+		dir := filepath.Join(base, fmt.Sprint(cut))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(dataFileName(dir, 1), data[:cut], 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		// A record survives only if the cut is at or after its end.
+		intact := 0
+		for intact < len(ends) && ends[intact] <= cut {
+			intact++
+		}
+		checkRecovered(t, dir, intact)
 	}
 }
 
-// ---- lock ------------------------------------------------------------------
+// Flips every single byte of the log, one at a time. The damaged record and
+// everything after it must be dropped; everything before it must survive.
+func TestCrashFlipEveryByte(t *testing.T) {
+	data, ends := referenceLog(t)
+	base := t.TempDir()
 
-func TestDirectoryLock(t *testing.T) {
-	dir := t.TempDir()
-	b1 := openStore(t, dir, Options{})
+	for pos := 0; pos < len(data); pos++ {
+		bad := append([]byte(nil), data...) // work on a copy
+		bad[pos] ^= 0xFF
 
-	// Second open of the same directory must be refused.
-	if _, err := Open(dir, Options{}); !errors.Is(err, ErrLocked) {
-		t.Fatalf("want ErrLocked, got %v", err)
+		dir := filepath.Join(base, fmt.Sprint(pos))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(dataFileName(dir, 1), bad, 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		// The damaged record is the first one that ends after byte `pos`.
+		damaged := 0
+		for ends[damaged] <= pos {
+			damaged++
+		}
+		checkRecovered(t, dir, damaged)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Kill during write: a REAL process is killed in the middle of writing.
+//
+// The test binary starts a copy of itself (TestCrashHelper below), reads its
+// progress, kills it, and then reopens the directory.
+// ---------------------------------------------------------------------------
+
+// TestCrashHelper is NOT a normal test. It only does something when the
+// parent test starts it with KV_CRASH_HELPER_DIR set. It writes keys forever
+// and prints each number AFTER the Put for it has returned.
+func TestCrashHelper(t *testing.T) {
+	dir := os.Getenv("KV_CRASH_HELPER_DIR")
+	if dir == "" {
+		t.Skip("helper process, started by TestKillDuringWrite")
 	}
 
-	// After closing, the directory can be opened again.
-	b1.Close()
-	b2, err := Open(dir, Options{})
+	b, err := Open(dir, Options{MaxFileSize: 4096}) // small: forces rotation too
 	if err != nil {
-		t.Fatalf("reopen after close: %v", err)
+		fmt.Println("open failed:", err)
+		os.Exit(1)
 	}
-	b2.Close()
+	for i := 0; i < 1_000_000; i++ {
+		if err := b.Put(fmt.Sprintf("k%d", i), []byte(fmt.Sprintf("value-%d", i)), int64(i+1)); err != nil {
+			fmt.Println("put failed:", err)
+			os.Exit(1)
+		}
+		fmt.Println(i)
+	}
+	os.Exit(0)
+}
+
+func TestKillDuringWrite(t *testing.T) {
+	dir := t.TempDir()
+
+	// Start a copy of this test binary that runs only TestCrashHelper.
+	cmd := exec.Command(os.Args[0], "-test.run=^TestCrashHelper$")
+	cmd.Env = append(os.Environ(), "KV_CRASH_HELPER_DIR="+dir)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait until the helper says it finished ~500 writes, then kill it hard.
+	last := -1
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		n, err := strconv.Atoi(scanner.Text())
+		if err != nil {
+			cmd.Process.Kill()
+			cmd.Wait()
+			t.Fatalf("helper printed %q", scanner.Text())
+		}
+		last = n
+		if n >= 500 {
+			break
+		}
+	}
+	cmd.Process.Kill()
+	cmd.Wait() // returns an error because we killed it; that's expected
+	if last < 500 {
+		t.Fatalf("helper stopped early (last reported write: %d)", last)
+	}
+
+	// Reopen. The OS has released the directory lock because the process is gone.
+	b := openStore(t, dir, Options{MaxFileSize: 4096})
+
+	// Writes were appended in order, so what survives must be keys 0..m-1
+	// with no gaps and correct values.
+	m := 0
+	for {
+		val, _, err := b.Get(fmt.Sprintf("k%d", m))
+		if err != nil {
+			break
+		}
+		if string(val) != fmt.Sprintf("value-%d", m) {
+			t.Fatalf("k%d has wrong value %q", m, val)
+		}
+		m++
+	}
+	for i := m; i < m+50; i++ {
+		mustBeGone(t, b, fmt.Sprintf("k%d", i)) // no gaps after the cut
+	}
+
+	// Everything the helper reported as written must have survived.
+	// (Process kill keeps data the OS already has; only a power cut could
+	// lose it, since we don't fsync. That is a documented non-guarantee.)
+	if m <= last {
+		t.Fatalf("lost acknowledged writes: %d survived, helper reported %d", m, last+1)
+	}
+
+	// And the store keeps working.
+	if err := b.Put("after", []byte("ok"), 1_000_000_000); err != nil {
+		t.Fatal(err)
+	}
+	mustGet(t, b, "after", "ok")
 }

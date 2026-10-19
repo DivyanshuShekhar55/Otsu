@@ -124,7 +124,7 @@ func TestRecoveryCorruptOldFile(t *testing.T) {
 
 func TestMerge(t *testing.T) {
 	dir := t.TempDir()
-	b := openStore(t, dir, Options{MaxFileSize: 100})
+	b := openStore(t, dir, mergeOpts)
 
 	// Overwrite the same 4 keys 5 times -> lots of dead records on disk.
 	for round := 1; round <= 5; round++ {
@@ -165,7 +165,7 @@ func TestMerge(t *testing.T) {
 
 	// ...and everything survives a restart.
 	b.Close()
-	b = openStore(t, dir, Options{MaxFileSize: 100})
+	b = openStore(t, dir, mergeOpts)
 	check(b)
 	mustGet(t, b, "new", "after-merge")
 }
